@@ -163,44 +163,438 @@ end tell
     }
 }
 
+#[cfg(target_os = "windows")]
+const OVERLAY_COLOR_KEY: u32 = 0x00FF00FF;
+#[cfg(target_os = "windows")]
+const OVERLAY_INPUT_BG: u32 = 0x001E1E1E;
+#[cfg(target_os = "windows")]
+static OVERLAY_CLASS_REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static OVERLAY_HWND: std::sync::atomic::AtomicPtr<core::ffi::c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+#[cfg(target_os = "windows")]
+static OVERLAY_EDIT_HWND: std::sync::atomic::AtomicPtr<core::ffi::c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(target_os = "windows")]
+struct NativeKeyState {
+    prev: [bool; 256],
+    hold: [u16; 256],
+}
+
+#[cfg(target_os = "windows")]
+static NATIVE_KEY_STATE: std::sync::OnceLock<std::sync::Mutex<NativeKeyState>> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn native_key_state() -> &'static std::sync::Mutex<NativeKeyState> {
+    NATIVE_KEY_STATE.get_or_init(|| std::sync::Mutex::new(NativeKeyState { prev: [false; 256], hold: [0; 256] }))
+}
+
+#[cfg(target_os = "windows")]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn colorref(color: egui::Color32) -> u32 {
+    color.r() as u32 | ((color.g() as u32) << 8) | ((color.b() as u32) << 16)
+}
+
+#[cfg(target_os = "windows")]
+fn read_edit_text(hwnd: windows_sys::Win32::Foundation::HWND) -> String {
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
+        String::from_utf16_lossy(&buf[..len as usize])
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_edit_sel(hwnd: windows_sys::Win32::Foundation::HWND) -> (usize, usize) {
+    let mut start: u32 = 0;
+    let mut end: u32 = 0;
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+            hwnd,
+            0x00B0,
+            &mut start as *mut u32 as usize,
+            &mut end as *mut u32 as isize,
+        );
+    }
+    (start as usize, end as usize)
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn overlay_wnd_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    match msg {
+        0x0084 => 1, // WM_NCHITTEST -> HTCLIENT; keep textbox interactive.
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn create_native_overlay_window() -> windows_sys::Win32::Foundation::HWND {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    if !OVERLAY_CLASS_REGISTERED.load(std::sync::atomic::Ordering::SeqCst) {
+        let class_name = wide("SLPChatNativeOverlay");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(overlay_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: std::ptr::null_mut(),
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+            hIconSm: std::ptr::null_mut(),
+        };
+        RegisterClassExW(&wc);
+        OVERLAY_CLASS_REGISTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    let class_name = wide("SLPChatNativeOverlay");
+    let title = wide("SLP Overlay");
+    let hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        class_name.as_ptr(),
+        title.as_ptr(),
+        WS_POPUP,
+        0,
+        0,
+        1,
+        1,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null(),
+    );
+    if !hwnd.is_null() {
+        SetLayeredWindowAttributes(hwnd, OVERLAY_COLOR_KEY, 0, LWA_COLORKEY);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    hwnd
+}
+
+#[cfg(target_os = "windows")]
+fn decode_bgra(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(data).ok()?.resize_exact(w, h, image::imageops::FilterType::Triangle);
+    let rgba = img.to_rgba8();
+    let mut bgra = Vec::with_capacity((w * h * 4) as usize);
+    for p in rgba.chunks(4) {
+        bgra.push(p[2]);
+        bgra.push(p[1]);
+        bgra.push(p[0]);
+        bgra.push(p[3]);
+    }
+    Some(bgra)
+}
+
+#[cfg(target_os = "windows")]
+struct NativeParticipant {
+    name: String,
+    colorref: u32,
+    talking: bool,
+    bgra: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "windows")]
+struct NativeMessage {
+    time: String,
+    sender: Option<String>,
+    content: String,
+    colorref: u32,
+    text_colorref: u32,
+}
+
 impl SlpChatApp {
     pub(crate) fn render_dolphin_overlay(&mut self, ctx: &egui::Context) {
-        if !self.config.overlay_enabled || !self.overlay_visible {
+        #[cfg(target_os = "windows")]
+        {
+            self.render_windows_native_overlay();
+            let _ = ctx;
             return;
         }
 
-        self.overlay_hint_passes = self.overlay_hint_passes.saturating_sub(1);
+        #[cfg(not(target_os = "windows"))]
+        {
+            if !self.config.overlay_enabled || !self.overlay_visible {
+                return;
+            }
 
-        let Some((_, dx, dy, dw, dh)) = find_dolphin_rect() else {
+            self.overlay_hint_passes = self.overlay_hint_passes.saturating_sub(1);
+
+            let Some((_, dx, dy, dw, dh)) = find_dolphin_rect() else {
+                return;
+            };
+
+            let viewport_pos = egui::pos2(dx as f32, dy as f32);
+            let viewport_size = egui::vec2(dw.max(1) as f32, dh.max(1) as f32);
+            let content = self.overlay_content_rect(viewport_size);
+
+            let viewport = egui::ViewportBuilder::default()
+                .with_title("SLP Overlay")
+                .with_app_id("slpauth_app_overlay")
+                .with_inner_size([viewport_size.x, viewport_size.y])
+                .with_min_inner_size([viewport_size.x, viewport_size.y])
+                .with_max_inner_size([viewport_size.x, viewport_size.y])
+                .with_position(viewport_pos)
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_transparent(true)
+                .with_taskbar(false)
+                .with_always_on_top();
+
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("slp_overlay"),
+                viewport,
+                |overlay_ctx, _| self.render_old_style_overlay(overlay_ctx, content),
+            );
+
+            if self.overlay_hint_passes % 2 == 0 {
+                Self::apply_compositor_overlay_hints(viewport_pos, viewport_size);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn render_windows_native_overlay(&mut self) {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+        if !self.config.overlay_enabled || !self.overlay_visible {
+            let hwnd = OVERLAY_HWND.load(Ordering::SeqCst) as windows_sys::Win32::Foundation::HWND;
+            if !hwnd.is_null() {
+                unsafe { ShowWindow(hwnd, SW_HIDE) };
+            }
+            return;
+        }
+
+        let Some((dolphin_hwnd_raw, dx, dy, dw, dh)) = find_dolphin_rect() else {
+            let hwnd = OVERLAY_HWND.load(Ordering::SeqCst) as windows_sys::Win32::Foundation::HWND;
+            if !hwnd.is_null() {
+                unsafe { ShowWindow(hwnd, SW_HIDE) };
+            }
             return;
         };
 
-        let viewport_pos = egui::pos2(dx as f32, dy as f32);
+        let mut hwnd = OVERLAY_HWND.load(Ordering::SeqCst) as windows_sys::Win32::Foundation::HWND;
+        if hwnd.is_null() {
+            hwnd = unsafe { create_native_overlay_window() };
+            OVERLAY_HWND.store(hwnd as *mut core::ffi::c_void, Ordering::SeqCst);
+            if hwnd.is_null() {
+                return;
+            }
+        }
+
+        let mut edit = OVERLAY_EDIT_HWND.load(Ordering::SeqCst) as windows_sys::Win32::Foundation::HWND;
+        if edit.is_null() {
+            let edit_class = wide("EDIT");
+            edit = unsafe {
+                CreateWindowExW(
+                    0,
+                    edit_class.as_ptr(),
+                    std::ptr::null(),
+                    0x40000080,
+                    0,
+                    0,
+                    self.theme.overlay_window_w.max(100),
+                    INPUT_H as i32,
+                    hwnd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            OVERLAY_EDIT_HWND.store(edit as *mut core::ffi::c_void, Ordering::SeqCst);
+        }
+
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        self.poll_native_overlay_keyboard(edit, dolphin_hwnd_raw as windows_sys::Win32::Foundation::HWND, hwnd);
+
         let viewport_size = egui::vec2(dw.max(1) as f32, dh.max(1) as f32);
         let content = self.overlay_content_rect(viewport_size);
+        let input_text = if edit.is_null() { String::new() } else { read_edit_text(edit) };
+        let (sel_start, sel_end) = if edit.is_null() { (0, 0) } else { read_edit_sel(edit) };
+        let messages = self.native_overlay_messages();
+        let participants = self.native_overlay_participants();
+        let media_on_right = matches!(self.theme.overlay_position, 0 | 2);
 
-        let viewport = egui::ViewportBuilder::default()
-            .with_title("SLP Overlay")
-            .with_app_id("slpauth_app_overlay")
-            .with_inner_size([viewport_size.x, viewport_size.y])
-            .with_min_inner_size([viewport_size.x, viewport_size.y])
-            .with_max_inner_size([viewport_size.x, viewport_size.y])
-            .with_position(viewport_pos)
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_transparent(true)
-            .with_taskbar(false)
-            .with_always_on_top();
-
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("slp_overlay"),
-            viewport,
-            |overlay_ctx, _| self.render_old_style_overlay(overlay_ctx, content),
-        );
-
-        if self.overlay_hint_passes % 2 == 0 {
-            Self::apply_compositor_overlay_hints(viewport_pos, viewport_size);
+        unsafe {
+            SetWindowPos(hwnd, HWND_TOPMOST, dx, dy, dw, dh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            paint_native_overlay_window(
+                hwnd,
+                dw,
+                dh,
+                content,
+                &messages,
+                &participants,
+                &input_text,
+                sel_start,
+                sel_end,
+                self.theme.overlay_text_size.max(8),
+                colorref(rgb_to_color32(&self.theme.overlay_outline_color)),
+                self.theme.overlay_outline_thickness.max(0),
+                media_on_right,
+            );
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn poll_native_overlay_keyboard(
+        &mut self,
+        edit: windows_sys::Win32::Foundation::HWND,
+        dolphin_hwnd: windows_sys::Win32::Foundation::HWND,
+        overlay_hwnd: windows_sys::Win32::Foundation::HWND,
+    ) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        if edit.is_null() {
+            return;
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        if fg != dolphin_hwnd && fg != overlay_hwnd {
+            if let Ok(mut state) = native_key_state().lock() {
+                state.prev = [false; 256];
+                state.hold = [0; 256];
+            }
+            return;
+        }
+
+        let mut cur = [false; 256];
+        for vk in 0u16..=0xFEu16 {
+            cur[vk as usize] = unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
+        }
+        unsafe {
+            let mut ks = [0u8; 256];
+            GetKeyboardState(ks.as_mut_ptr());
+            for vk in 0u16..=0xFEu16 {
+                if cur[vk as usize] { ks[vk as usize] |= 0x80; } else { ks[vk as usize] &= !0x80; }
+            }
+            SetKeyboardState(ks.as_ptr());
+        }
+        let ctrl = cur[0x11];
+        let mut state = match native_key_state().lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        const REPEAT_DELAY: u16 = 30;
+        const REPEAT_RATE: u16 = 3;
+        for vk in 0x08u16..=0xFEu16 {
+            if matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0x14 | 0x90 | 0x91) {
+                continue;
+            }
+            let down = cur[vk as usize];
+            let was_down = state.prev[vk as usize];
+            state.prev[vk as usize] = down;
+            let trigger = if down && !was_down {
+                state.hold[vk as usize] = 0;
+                true
+            } else if down && was_down {
+                state.hold[vk as usize] = state.hold[vk as usize].saturating_add(1);
+                let h = state.hold[vk as usize];
+                h >= REPEAT_DELAY && (h - REPEAT_DELAY) % REPEAT_RATE == 0
+            } else {
+                state.hold[vk as usize] = 0;
+                false
+            };
+            if !trigger {
+                continue;
+            }
+            if vk == 0x0D {
+                drop(state);
+                let text = read_edit_text(edit);
+                unsafe { SetWindowTextW(edit, wide("").as_ptr()) };
+                if !text.trim().is_empty() {
+                    self.input_text = text;
+                    self.send_text();
+                }
+                return;
+            }
+            let scan = unsafe { MapVirtualKeyW(vk as u32, 0) };
+            let extended = matches!(vk, 0x25 | 0x26 | 0x27 | 0x28 | 0x24 | 0x23 | 0x2D | 0x2E | 0x21 | 0x22);
+            let lparam = ((scan & 0xFF) << 16) as isize | 1 | if extended { 1 << 24 } else { 0 };
+            unsafe { SendMessageW(edit, 0x0100, vk as usize, lparam) };
+            if !ctrl {
+                let mut char_buf = [0u16; 4];
+                let mut ks = [0u8; 256];
+                unsafe { GetKeyboardState(ks.as_mut_ptr()) };
+                let n = unsafe { ToUnicode(vk as u32, scan, ks.as_ptr(), char_buf.as_mut_ptr(), 4, 0) };
+                if n > 0 {
+                    for ch in char_buf.iter().take(n as usize) {
+                        if *ch >= 0x20 || *ch == 0x08 {
+                            unsafe { SendMessageW(edit, 0x0102, *ch as usize, lparam) };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn native_overlay_messages(&self) -> Vec<NativeMessage> {
+        self.overlay_messages()
+            .into_iter()
+            .map(|m| NativeMessage {
+                time: m.time,
+                sender: m.sender,
+                content: m.content,
+                colorref: colorref(m.color),
+                text_colorref: colorref(m.text_color),
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn native_overlay_participants(&self) -> Vec<NativeParticipant> {
+        let mut out = Vec::new();
+        let self_bgra = self
+            .chat
+            .peer_video_frames
+            .get(LOCAL_WEBCAM_PEER_ID)
+            .and_then(|d| decode_bgra(d, 48, 48))
+            .or_else(|| self.avatar_png.as_deref().and_then(|d| decode_bgra(d, 48, 48)));
+        out.push(NativeParticipant {
+            name: self.username.clone(),
+            colorref: colorref(rgb_to_color32(&self.name_color)),
+            talking: self.voice.is_self_talking(),
+            bgra: self_bgra,
+        });
+        for (peer_id, name) in &self.chat.peer_names {
+            let color = self.chat.peer_colors.get(peer_id).copied().unwrap_or(Colors::TEXT_NAME_OTHER);
+            let bgra = self
+                .chat
+                .peer_video_frames
+                .get(peer_id)
+                .and_then(|d| decode_bgra(d, 48, 48))
+                .or_else(|| self.chat.peer_avatars.get(peer_id).and_then(|d| decode_bgra(d, 48, 48)));
+            out.push(NativeParticipant {
+                name: name.clone(),
+                colorref: colorref(color),
+                talking: self.voice.is_peer_talking(peer_id),
+                bgra,
+            });
+        }
+        out
     }
 
     fn overlay_content_rect(&self, viewport_size: egui::Vec2) -> egui::Rect {
@@ -482,6 +876,262 @@ impl SlpChatApp {
             py += avatar_size + PAD;
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn paint_native_overlay_window(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    w: i32,
+    h: i32,
+    content: egui::Rect,
+    messages: &[NativeMessage],
+    participants: &[NativeParticipant],
+    input_text: &str,
+    _sel_start: usize,
+    sel_end: usize,
+    text_size: i32,
+    outline_colorref: u32,
+    outline_thickness: i32,
+    media_on_right: bool,
+) {
+    use windows_sys::Win32::Foundation::{RECT, SIZE};
+    use windows_sys::Win32::Graphics::Gdi::*;
+
+    const DT_LEFT: u32 = 0x0000;
+    const DT_WORDBREAK: u32 = 0x0010;
+    const DT_CALCRECT: u32 = 0x0400;
+    const DT_NOPREFIX: u32 = 0x0800;
+    const TRANSPARENT_BK: i32 = 1;
+    const NULL_BRUSH_ID: i32 = 5;
+
+    let hdc = GetDC(hwnd);
+    if hdc.is_null() {
+        return;
+    }
+    let mem_dc = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, w, h);
+    let old_bmp = SelectObject(mem_dc, bmp);
+
+    let full_rc = RECT { left: 0, top: 0, right: w, bottom: h };
+    let bg = CreateSolidBrush(OVERLAY_COLOR_KEY);
+    FillRect(mem_dc, &full_rc, bg);
+    DeleteObject(bg);
+
+    let font_name = wide("Segoe UI");
+    let font = CreateFontW(
+        -text_size, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 3, 0, font_name.as_ptr(),
+    );
+    let old_font = SelectObject(mem_dc, font);
+    SetBkMode(mem_dc, TRANSPARENT_BK);
+
+    let cx = content.min.x.round() as i32;
+    let cy = content.min.y.round() as i32;
+    let cw = content.width().round() as i32;
+    let ch = content.height().round() as i32;
+    let input_h = INPUT_H as i32;
+    let pad = PAD as i32;
+    let msg_bottom = cy + ch - input_h;
+    let sidebar_w = if participants.is_empty() { 0 } else { MEDIA_W as i32 };
+    let sidebar_x = if media_on_right { cx + cw - sidebar_w } else { cx };
+    let text_left = if media_on_right { cx + pad } else { cx + sidebar_w + GAP as i32 + pad };
+    let text_right = if media_on_right { cx + cw - sidebar_w - GAP as i32 - pad } else { cx + cw - pad };
+
+    if sidebar_w > 0 {
+        let small_font = CreateFontW(
+            -(text_size - 2).max(8), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 3, 0, font_name.as_ptr(),
+        );
+        let prev_font = SelectObject(mem_dc, small_font);
+        let avatar_size = 48;
+        let mut py = cy + pad;
+        for p in participants {
+            if py + avatar_size > cy + ch - pad {
+                break;
+            }
+            let ax = sidebar_x + pad;
+            if let Some(bgra) = &p.bgra {
+                let bmi_header = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 48,
+                    biHeight: -48,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0,
+                    biSizeImage: 0,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                };
+                #[repr(C)]
+                struct BmpInfo { header: BITMAPINFOHEADER, colors: [u8; 4] }
+                let bmi = BmpInfo { header: bmi_header, colors: [0; 4] };
+                StretchDIBits(
+                    mem_dc,
+                    ax,
+                    py,
+                    avatar_size,
+                    avatar_size,
+                    0,
+                    0,
+                    48,
+                    48,
+                    bgra.as_ptr() as *const _,
+                    &bmi as *const _ as *const BITMAPINFO,
+                    0,
+                    SRCCOPY,
+                );
+            } else {
+                let sq = RECT { left: ax, top: py, right: ax + avatar_size, bottom: py + avatar_size };
+                let brush = CreateSolidBrush(p.colorref);
+                FillRect(mem_dc, &sq, brush);
+                DeleteObject(brush);
+                if let Some(initial) = p.name.chars().next() {
+                    let s = wide(&initial.to_uppercase().to_string());
+                    SetTextColor(mem_dc, 0x00FFFFFF);
+                    TextOutW(mem_dc, ax + avatar_size / 2 - text_size / 3, py + avatar_size / 2 - text_size / 2, s.as_ptr(), 1);
+                }
+            }
+            if p.talking {
+                let brush = CreateSolidBrush(p.colorref);
+                for i in 0..TALK_STROKE as i32 {
+                    let rc = RECT { left: ax + i, top: py + i, right: ax + avatar_size - i, bottom: py + avatar_size - i };
+                    FrameRect(mem_dc, &rc, brush);
+                }
+                DeleteObject(brush);
+            }
+
+            let name = short_name(&p.name);
+            let name_w = wide(&name);
+            let name_len = (name_w.len() - 1) as i32;
+            let nx = ax + avatar_size + 5;
+            let ny = py + (avatar_size - text_size) / 2;
+            if outline_thickness > 0 {
+                SetTextColor(mem_dc, outline_colorref);
+                for ox in -outline_thickness..=outline_thickness {
+                    for oy in -outline_thickness..=outline_thickness {
+                        if ox != 0 || oy != 0 {
+                            TextOutW(mem_dc, nx + ox, ny + oy, name_w.as_ptr(), name_len);
+                        }
+                    }
+                }
+            }
+            SetTextColor(mem_dc, p.colorref);
+            TextOutW(mem_dc, nx, ny, name_w.as_ptr(), name_len);
+            py += avatar_size + pad;
+        }
+        SelectObject(mem_dc, prev_font);
+        DeleteObject(small_font);
+    }
+    SelectObject(mem_dc, font);
+
+    let mut heights = Vec::with_capacity(messages.len());
+    for m in messages {
+        let text = if let Some(sender) = &m.sender {
+            format!("[{}] {}: {}", m.time, sender, m.content)
+        } else {
+            format!("[{}] {}", m.time, m.content)
+        };
+        let wt = wide(&text);
+        let mut rc = RECT { left: text_left, top: 0, right: text_right, bottom: msg_bottom };
+        let th = DrawTextW(mem_dc, wt.as_ptr(), (wt.len() - 1) as i32, &mut rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+        heights.push(th.max(text_size + 4));
+    }
+    let total_h: i32 = heights.iter().sum();
+    let avail_h = msg_bottom - cy - pad;
+    let mut y = if total_h <= avail_h { msg_bottom - total_h } else { cy + pad };
+    let start_idx = if total_h > avail_h {
+        let mut skip = total_h - avail_h;
+        let mut idx = 0;
+        while idx < heights.len() && skip > 0 {
+            skip -= heights[idx];
+            idx += 1;
+        }
+        idx
+    } else { 0 };
+    if start_idx > 0 {
+        y = msg_bottom;
+        for i in (start_idx..heights.len()).rev() { y -= heights[i]; }
+    }
+
+    for (i, m) in messages.iter().enumerate().skip(start_idx) {
+        if y >= msg_bottom { break; }
+        let is_system = m.sender.is_none();
+        let full = if let Some(sender) = &m.sender {
+            format!("[{}] {}: {}", m.time, sender, m.content)
+        } else {
+            format!("[{}] {}", m.time, m.content)
+        };
+        let full_w = wide(&full);
+        let full_len = (full_w.len() - 1) as i32;
+        if outline_thickness > 0 {
+            SetTextColor(mem_dc, outline_colorref);
+            for ox in -outline_thickness..=outline_thickness {
+                for oy in -outline_thickness..=outline_thickness {
+                    if ox != 0 || oy != 0 {
+                        let mut rc = RECT { left: text_left + ox, top: y + oy, right: text_right + ox, bottom: msg_bottom };
+                        DrawTextW(mem_dc, full_w.as_ptr(), full_len, &mut rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+                    }
+                }
+            }
+        }
+        SetTextColor(mem_dc, if is_system { m.colorref } else { m.text_colorref });
+        let mut rc = RECT { left: text_left, top: y, right: text_right, bottom: msg_bottom };
+        DrawTextW(mem_dc, full_w.as_ptr(), full_len, &mut rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+        if let Some(sender) = &m.sender {
+            let time_prefix = format!("[{}] ", m.time);
+            let time_w = wide(&time_prefix);
+            let time_len = (time_w.len() - 1) as i32;
+            let mut time_size = SIZE { cx: 0, cy: 0 };
+            GetTextExtentPoint32W(mem_dc, time_w.as_ptr(), time_len, &mut time_size);
+            let name_prefix = format!("{}: ", sender);
+            let name_w = wide(&name_prefix);
+            SetTextColor(mem_dc, m.colorref);
+            TextOutW(mem_dc, text_left + time_size.cx, y, name_w.as_ptr(), (name_w.len() - 1) as i32);
+        }
+        y += heights[i];
+    }
+
+    let bar_top = cy + ch - input_h;
+    let bar_rc = RECT { left: cx, top: bar_top, right: cx + cw, bottom: cy + ch };
+    let bar = CreateSolidBrush(OVERLAY_INPUT_BG);
+    FillRect(mem_dc, &bar_rc, bar);
+    DeleteObject(bar);
+    let line = CreateSolidBrush(0x003A3A3A);
+    FillRect(mem_dc, &RECT { left: cx, top: bar_top, right: cx + cw, bottom: bar_top + 1 }, line);
+    DeleteObject(line);
+
+    let tx = cx + pad + 4;
+    let ty = bar_top + (input_h - text_size) / 2;
+    if input_text.is_empty() {
+        let ph = wide("Type a message...");
+        SetTextColor(mem_dc, 0x00888888);
+        TextOutW(mem_dc, tx, ty, ph.as_ptr(), (ph.len() - 1) as i32);
+    } else {
+        let txt = wide(input_text);
+        SetTextColor(mem_dc, 0x00FFFFFF);
+        TextOutW(mem_dc, tx, ty, txt.as_ptr(), (txt.len() - 1) as i32);
+    }
+    let caret_byte = char_to_byte(input_text, sel_end);
+    let before = wide(&input_text[..caret_byte]);
+    let mut caret_size = SIZE { cx: 0, cy: 0 };
+    GetTextExtentPoint32W(mem_dc, before.as_ptr(), (before.len() - 1) as i32, &mut caret_size);
+    let caret = CreateSolidBrush(0x00FFFFFF);
+    FillRect(mem_dc, &RECT { left: tx + caret_size.cx, top: bar_top + 3, right: tx + caret_size.cx + 2, bottom: cy + ch - 3 }, caret);
+    DeleteObject(caret);
+
+    BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+
+    SelectObject(mem_dc, old_font);
+    SelectObject(mem_dc, old_bmp);
+    DeleteObject(font);
+    DeleteObject(bmp);
+    DeleteDC(mem_dc);
+    ReleaseDC(hwnd, hdc);
+}
+
+#[cfg(target_os = "windows")]
+fn char_to_byte(s: &str, char_pos: usize) -> usize {
+    s.char_indices().nth(char_pos).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 struct OverlayParticipant {
