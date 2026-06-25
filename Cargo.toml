@@ -3,7 +3,7 @@ name = "slpauth_app"
 edition = "2021"
 
 [dependencies]
-ssp-client = { path = "../SLPauth/ssp_client" }
+ssp-client = "0.1.0"
 tokio = { version = "1", features = ["full"] }
 cpal = "0.15"
 audiopus = "0.3.0-rc.0"
