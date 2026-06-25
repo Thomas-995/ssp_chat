@@ -919,6 +919,14 @@ impl SlpChatApp {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for SlpChatApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.config.overlay_enabled {
+            egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+        } else {
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.start_background_repaint_waker(ctx);
         self.apply_theme(ctx);
