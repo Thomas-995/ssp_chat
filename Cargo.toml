@@ -1,0 +1,64 @@
+[package]
+name = "slpauth_app"
+edition = "2021"
+
+[dependencies]
+ssp-client = { path = "../SLPauth/ssp_client" }
+tokio = { version = "1", features = ["full"] }
+cpal = "0.15"
+audiopus = "0.3.0-rc.0"
+eframe = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+nokhwa = { version = "0.10", features = ["input-native"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+rfd = "0.15"
+whoami = "1"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# -- Handshake test profiles (cargo features) ---------------------------------
+# Each feature selects a different rollover/offset range so you can run two
+# instances side-by-side and verify negotiation.  The default build uses the
+# "normal" range.
+#
+#   cargo run -p slpauth_app                          # default (normal)
+#   cargo run -p slpauth_app --features profile-tight
+#   cargo run -p slpauth_app --features profile-wide
+#   cargo run -p slpauth_app --features profile-mismatch
+#
+# Or use the dedicated binaries:
+#   cargo run -p slpauth_app --bin slpauth_app_tight
+#   cargo run -p slpauth_app --bin slpauth_app_wide
+#   cargo run -p slpauth_app --bin slpauth_app_mismatch
+
+[features]
+default = []
+profile-tight  = []   # rollover 30-60-90,  offset 15-30-60
+profile-wide   = []   # rollover 60-240-480, offset 30-120-240
+profile-mismatch = [] # rollover 500-600-700, offset 250-300-350  (should be rejected by normal/tight)
+
+[[bin]]
+name = "slpauth_app"
+path = "src/main.rs"
+
+[[bin]]
+name = "slpauth_app_tight"
+path = "src/bin/tight.rs"
+
+[[bin]]
+name = "slpauth_app_wide"
+path = "src/bin/wide.rs"
+
+[[bin]]
+name = "slpauth_app_mismatch"
+path = "src/bin/mismatch.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Time", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse"] }
