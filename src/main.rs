@@ -130,11 +130,19 @@ fn main() {
     //     return;
     // }
 
+    let pid = std::process::id();
+    let instance_app_id = format!("slpauth_app_{pid}");
+    let instance_title = if std::env::var_os("SLPAUTH_SINGLE_WINDOW_TITLE").is_some() {
+        "SLP Chat".to_string()
+    } else {
+        format!("SLP Chat ({pid})")
+    };
+
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([800.0, 600.0])
         .with_min_inner_size([500.0, 350.0])
-        .with_app_id("slpauth_app")
-        .with_title("SLP Chat");
+        .with_app_id(instance_app_id)
+        .with_title(instance_title.clone());
 
     // In overlay-startup mode, start hidden until explicitly signaled.
     // On Windows we cannot use with_visible(false) — it freezes the event
@@ -158,7 +166,7 @@ fn main() {
     };
 
     eframe::run_native(
-        "SLP Chat",
+        &instance_title,
         native_options,
         Box::new(move |_cc| Ok(Box::new(app::SlpChatApp::new(launched_at_startup)))),
     )
