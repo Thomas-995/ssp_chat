@@ -1,0 +1,5 @@
+[env]
+# audiopus_sys 0.2.2 vendors an old Opus CMake project. CMake 4 removed
+# compatibility with projects declaring cmake_minimum_required(< 3.5), so on
+# Windows machines with CMake 4 the build fails unless this policy floor is set.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

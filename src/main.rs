@@ -114,15 +114,21 @@ fn signal_show_window() {
 fn main() {
     let launched_at_startup = std::env::args().any(|a| a == "--startup");
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    if std::env::var_os("SLPAUTH_ALLOW_MULTI_INSTANCE").is_none()
-        && !try_acquire_single_instance()
-    {
-        if !launched_at_startup {
-            signal_show_window();
-        }
-        return;
-    }
+    // Multiple app instances are currently allowed on all operating systems.
+    // Keep the old single-instance gate here so it can be restored later if
+    // desired. Re-enable this block to make Windows/macOS focus an existing
+    // app instance instead of starting another one. The env var bypass is kept
+    // in the preserved code for the old local multi-instance test workflow.
+    //
+    // #[cfg(any(target_os = "windows", target_os = "macos"))]
+    // if std::env::var_os("SLPAUTH_ALLOW_MULTI_INSTANCE").is_none()
+    //     && !try_acquire_single_instance()
+    // {
+    //     if !launched_at_startup {
+    //         signal_show_window();
+    //     }
+    //     return;
+    // }
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([800.0, 600.0])
